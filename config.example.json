@@ -1,0 +1,33 @@
+{
+  "bot_login": "your-bot-account",
+  "bot_name": "Hermes",
+  "owner_login": "your-github-login",
+
+  "hermes": {
+    "ssh_host": "root@your-hermes-host",
+    "ssh_key": "~/.ssh/id_ed25519",
+    "webhook_base": "http://your-hermes-host:8644"
+  },
+
+  "gate": {
+    "token_file": "/root/.config/gh-bot/token",
+    "hermes_env": "/root/.hermes/.env",
+    "router_log": "/root/.hermes/logs/github-router.jsonl",
+    "router_model": "typesafe/jev-router",
+    "instant_model": "anthropic/claude-haiku-4.5"
+  },
+
+  "agent_token_path": "/home/you/.config/gh-bot/token",
+
+  "routes": {
+    "github": { "profile": null, "opus_subagent": false },
+    "github-api": { "profile": "api", "opus_subagent": true }
+  },
+
+  "repos": {
+    "your-github-login/side-project": "github",
+    "your-github-login/api": "github-api"
+  },
+
+  "legacy_routes": []
+}

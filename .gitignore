@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.DS_Store
+# your real deployment config (hosts, repos, paths). Copy config.example.json to start.
+config.json
