@@ -105,6 +105,24 @@ class MentionTests(unittest.TestCase):
         self.assertFalse(gate.addressed_elsewhere("ping me at a@b.com"))
 
 
+class AccessGuardTests(unittest.TestCase):
+    def test_disclaimers_caught(self):
+        for bad in ["I don't have access to the PR to review it.",
+                    "I can't see the repository from here.",
+                    "I'm an AI teammate without repo access by design.",
+                    "You can't give me repo access. Just paste code snippets here.",
+                    "Can you share the relevant parts of the diff?",
+                    "I do not have any access to that code."]:
+            self.assertTrue(gate.disclaims_access(bad), bad)
+
+    def test_normal_replies_pass(self):
+        for ok in ["Checking the diff, tests, and merge state now.",
+                   "Hey! What do you need on this PR?",
+                   "**Merge** keeps history, **rebase** rewrites it.",
+                   "Access tokens should go in the secrets store, not the repo."]:
+            self.assertFalse(gate.disclaims_access(ok), ok)
+
+
 class DecideTests(unittest.TestCase):
     def test_matrix(self):
         d = gate.decide
@@ -137,6 +155,11 @@ class GateFlowTests(Harness):
         self.assertEqual(self.posts(), ["Hey! What do you need?"])
         self.assertEqual(self.reactions(), ["eyes", "rocket"])
 
+    def test_em_dashes_removed_from_instant_reply(self):
+        self.instant = {"reply": "Squash merge makes one commit\u2014clean history.", "followup": False}
+        self.run_gate(comment_event("@example-bot squash vs rebase?"))
+        self.assertEqual(self.posts(), ["Squash merge makes one commit, clean history."])
+
     def test_thanks_gets_reaction_only(self):
         self.instant = {"reply": None, "reaction": "heart"}
         self.assertIsNone(self.run_gate(comment_event("@example-bot thanks!")))
@@ -151,6 +174,14 @@ class GateFlowTests(Harness):
         self.assertEqual(out["bot"]["instant_reply"], "Checking the CI logs now.")
         self.assertEqual(out["bot"]["target_type"], "PR")
         self.assertEqual(self.reactions(), ["eyes"])          # rocket comes from the agent when it finishes
+
+    def test_access_disclaimer_never_posted_and_escalates(self):
+        self.instant = {"reply": "I don't have access to the PR to review it.", "followup": False}
+        self.route = {"tier": "none", "why": "looks simple"}
+        out = self.run_gate(comment_event("@example-bot ready to merge?", is_pr=True))
+        self.assertEqual(self.posts(), [])
+        self.assertEqual(out["bot"]["tier"], "sonnet")
+        self.assertEqual(out["bot"]["instant_reply"], "(none posted)")
 
     def test_router_none_but_promise_forces_followup(self):
         self.instant = {"reply": "Looking at the diff now.", "followup": True}

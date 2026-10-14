@@ -118,13 +118,24 @@ what will be checked). YOUR job: decide whether real follow-up work is needed, a
 - "opus": heavy: multi-file implementation, deep debugging, architecture/design decisions, research across
   sources, large PR review, anything risky or long.
 If unsure, pick the higher tier. Assignments and review requests are never "none".
+Anything about THIS repo, PR, or issue (merge readiness, status, code, tests, CI) is never "none".
+Questions about BOTNAME's own access or abilities are never "none" (the agent answers them with facts).
 If the trigger says "no tag" and the message is clearly not for BOTNAME (a note to self, talking to someone
 else), pick "none".
 
 Return ONLY JSON: {"tier": "none|sonnet|opus", "why": "<10 words"}"""
 
 INSTANT_PROMPT = CONTEXT_NOTE + """
-You write BOTNAME's INSTANT reply, posted within seconds. You have NO repo access and NO tools.
+You write BOTNAME's INSTANT reply, posted within seconds, speaking AS BOTNAME.
+
+What BOTNAME can do: BOTNAME has full access to this repository. Right after your reply, a follow-up agent
+can read the code and diff, run gh and git, check CI, review, push branches, and open PRs. YOU personally
+only see the message and the thread below, so you never answer code/PR/CI questions yourself: you hand
+them to the follow-up agent.
+
+NEVER say or imply that BOTNAME lacks access, can't see the repo, or needs things pasted. That is false.
+If the owner asks about BOTNAME's access or abilities, answer truthfully: yes, BOTNAME has repo access and
+is checking. Never claim the owner pasted or shared something unless it's literally in the thread.
 
 - Pure acknowledgement that expects nothing back (thanks, nice, ok, lgtm, praise): no text, just a reaction.
 - Anything that expects an answer, INCLUDING greetings ("hi", "hey", "are you there?"): reply in text.
@@ -134,8 +145,9 @@ You write BOTNAME's INSTANT reply, posted within seconds. You have NO repo acces
   clearly NOT for BOTNAME (a note to self, a reminder, talking to a teammate), set "ignore": true and nothing else.
   If it continues the conversation with BOTNAME or asks something, treat it normally.
 - Answerable from the message, the thread, or general knowledge: answer it, concisely.
-- Needs the codebase, CI, logs, research, or real work: write ONE short line saying what you'll look at
-  (e.g. "Checking the CI logs for the parcel test now."). Never guess about the code. Never invent results.
+- Needs the codebase, the PR diff/status, CI, logs, research, or real work (e.g. "is this ready to merge?",
+  "why does X fail?", "review this"): write ONE short line saying what you're checking, set "followup": true
+  (e.g. "Checking the diff, tests, and merge state now."). Never guess about the code. Never invent results.
 
 Style: direct, concise, contractions, no em dashes, markdown OK, no greetings, no "Great question".
 Return ONLY JSON: {"reply": "markdown or null", "reaction": "heart|+1|hooray|null", "followup": true if your reply promises more work, "ignore": true only if the message is not for BOTNAME}"""
@@ -269,6 +281,18 @@ def wake_kind(repo: str, number: int, obj: dict, is_pr: bool, text: str, where: 
     silent(f"{where} without mention in unwatched thread")
 
 
+NO_ACCESS = re.compile(
+    r"(do(?:n't| not)|can(?:'t|not)|unable to|without)\s+(?:have\s+)?(?:any\s+)?(?:access|see|view|read|open)"
+    r"|(?:no|without)\s+(?:any\s+)?(?:repo(?:sitory)?\s+|code\s+)?access"
+    r"|paste (?:the|it|code|your)|share (?:the|what) (?:code|diff|relevant)",
+    re.IGNORECASE)
+
+
+def disclaims_access(reply: str) -> bool:
+    """Instant replies must never claim the bot can't see the repo. If one does, drop it and escalate."""
+    return bool(reply) and bool(NO_ACCESS.search(reply))
+
+
 def decide(inst: dict, route_result: dict, posted: bool) -> str:
     """Merge the instant reply and the router verdict into one outcome: ignore, none, sonnet, or opus.
 
@@ -370,7 +394,11 @@ def main():
         reply = (inst.get("reply") or "").strip() if isinstance(inst.get("reply"), str) else ""
         if reply.lower() in ("null", "none"):
             reply = ""
+        reply = re.sub(r"\s*\u2014\s*", ", ", reply)  # house style: no em dashes
         posted = False
+        if disclaims_access(reply):
+            print(f"gate: dropped instant reply that disclaims access: {reply[:120]!r}", file=sys.stderr)
+            reply, inst = "", dict(inst, followup=True)
         if reply:
             try:
                 gh_post(reply_path(ctx), {"body": reply})
