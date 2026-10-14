@@ -47,10 +47,26 @@ MENTION = re.compile(rf"(?<![\w-])@{re.escape(BOT)}\b|(?<![\w/])/hermes\b", re.I
 ACK_REACTIONS = ("heart", "+1", "hooray")
 
 
+# Hermes kills route scripts after 30s (script_timeout_seconds) and then DROPS the event, so the gate
+# must always answer well inside that. Every network call gets a timeout cut from this budget.
+START = time.monotonic()
+BUDGET_S = 24.0
+
+
+def remaining() -> float:
+    return BUDGET_S - (time.monotonic() - START)
+
+
+def _exit(code: int = 0):
+    """Exit without waiting on stuck worker threads (a hung HTTP call must not hold the script open)."""
+    sys.stdout.flush(); sys.stderr.flush()
+    os._exit(code)
+
+
 def silent(reason: str):
-    print(f"ctx-gate: drop ({reason})", file=sys.stderr)
+    print(f"gate: drop ({reason})", file=sys.stderr)
     print("[SILENT]")
-    sys.exit(0)
+    _exit(0)
 
 
 def mentions(text) -> bool:
@@ -71,7 +87,7 @@ def thread_context(repo: str, number: int, skip_id=None) -> str:
     try:
         comments = gh_get(f"/repos/{repo}/issues/{number}/comments?per_page=100")
     except Exception as e:
-        print(f"ctx-gate: thread fetch failed: {e}", file=sys.stderr)
+        print(f"gate: thread fetch failed: {e}", file=sys.stderr)
         return "(thread unavailable)"
     lines = []
     for c in [c for c in comments if c.get("id") != skip_id][-8:]:
@@ -95,10 +111,10 @@ def react(path: str):
             },
         )
         with urllib.request.urlopen(req, timeout=8) as r:
-            print(f"ctx-gate: 👀 {r.status} {path}", file=sys.stderr)
+            print(f"gate: 👀 {r.status} {path}", file=sys.stderr)
         return True
     except Exception as e:  # never block the agent run on a failed reaction
-        print(f"ctx-gate: reaction failed {path}: {e}", file=sys.stderr)
+        print(f"gate: reaction failed {path}: {e}", file=sys.stderr)
         return False
 
 
@@ -183,19 +199,25 @@ def openrouter_key():
 
 
 def route(ctx: dict) -> dict:
-    err = None
+    err, r = None, None
     for attempt in range(2):
+        timeout = min(10.0, remaining() - 4)
+        if timeout < 2:
+            err = err or "no time left in budget"
+            break
         try:
-            r = llm_json(ROUTER_MODEL, ROUTER_PROMPT, describe(ctx), 800, 12)
+            r = llm_json(ROUTER_MODEL, ROUTER_PROMPT, describe(ctx), 800, timeout)
             r["router_model"] = r.pop("_model", None)
             if attempt:
                 r["why"] = (r.get("why") or "") + " (retry)"
             break
         except Exception as e:
             err = f"{type(e).__name__}: {e}"[:200]
-            print(f"ctx-gate: router attempt {attempt + 1} failed: {err}", file=sys.stderr)
+            print(f"gate: router attempt {attempt + 1} failed: {err}", file=sys.stderr)
     else:
         return {"tier": "sonnet", "why": "router unavailable", "error": err}
+    if r is None:
+        return {"tier": "sonnet", "why": "router out of time", "error": err}
     if r.get("tier") not in ("none", "sonnet", "opus"):
         r["tier"] = "sonnet"
     if ctx["kind"] in ("assigned to you", "review requested from you") and r["tier"] == "none":
@@ -205,10 +227,10 @@ def route(ctx: dict) -> dict:
 
 def instant(ctx: dict) -> dict:
     try:
-        r = llm_json(INSTANT_MODEL, INSTANT_PROMPT, describe(ctx), 700, 12)
+        r = llm_json(INSTANT_MODEL, INSTANT_PROMPT, describe(ctx), 700, max(2.0, min(10.0, remaining() - 4)))
         return r
     except Exception as e:
-        print(f"ctx-gate: instant reply failed: {e}", file=sys.stderr)
+        print(f"gate: instant reply failed: {e}", file=sys.stderr)
         return {"reply": None, "reaction": None, "followup": True}
 
 
@@ -225,7 +247,7 @@ def react_with(path: str, content: str):
     try:
         gh_post(path, {"content": content})
     except Exception as e:
-        print(f"ctx-gate: reaction {content} failed: {e}", file=sys.stderr)
+        print(f"gate: reaction {content} failed: {e}", file=sys.stderr)
 
 
 def reply_path(ctx: dict) -> str:
@@ -267,7 +289,7 @@ def engaged(repo: str, number: int, obj: dict, is_pr: bool) -> bool:
             if any((r.get("user") or {}).get("login") == BOT for r in gh_get(f"/repos/{repo}/pulls/{number}/reviews?per_page=100")):
                 return True
     except Exception as e:
-        print(f"ctx-gate: engagement check failed: {e}", file=sys.stderr)
+        print(f"gate: engagement check failed: {e}", file=sys.stderr)
     return False
 
 
@@ -388,25 +410,32 @@ def main():
 
     ctx["text"] = ctx["text"][:6000]
     t0 = time.time()
-    with concurrent.futures.ThreadPoolExecutor(2) as ex:
-        f_route, f_inst = ex.submit(route, ctx), ex.submit(instant, ctx)
-        inst = f_inst.result()
-        reply = (inst.get("reply") or "").strip() if isinstance(inst.get("reply"), str) else ""
-        if reply.lower() in ("null", "none"):
-            reply = ""
-        reply = re.sub(r"\s*\u2014\s*", ", ", reply)  # house style: no em dashes
-        posted = False
-        if disclaims_access(reply):
-            print(f"gate: dropped instant reply that disclaims access: {reply[:120]!r}", file=sys.stderr)
-            reply, inst = "", dict(inst, followup=True)
-        if reply:
-            try:
-                gh_post(reply_path(ctx), {"body": reply})
-                posted = True
-            except Exception as e:
-                print(f"ctx-gate: instant post failed: {e}", file=sys.stderr)
-        t_inst = time.time() - t0
-        r = f_route.result()
+    ex = concurrent.futures.ThreadPoolExecutor(2)
+    f_route, f_inst = ex.submit(route, ctx), ex.submit(instant, ctx)
+    try:
+        inst = f_inst.result(timeout=max(1.0, remaining() - 3))
+    except concurrent.futures.TimeoutError:
+        inst = {"reply": None, "reaction": None, "followup": True}
+    reply = (inst.get("reply") or "").strip() if isinstance(inst.get("reply"), str) else ""
+    if reply.lower() in ("null", "none"):
+        reply = ""
+    reply = re.sub(r"\s*\u2014\s*", ", ", reply)  # house style: no em dashes
+    posted = False
+    if disclaims_access(reply):
+        print(f"gate: dropped instant reply that disclaims access: {reply[:120]!r}", file=sys.stderr)
+        reply, inst = "", dict(inst, followup=True)
+    if reply:
+        try:
+            gh_post(reply_path(ctx), {"body": reply})
+            posted = True
+        except Exception as e:
+            print(f"gate: instant post failed: {e}", file=sys.stderr)
+    t_inst = time.time() - t0
+    try:
+        r = f_route.result(timeout=max(1.0, remaining() - 2))
+    except concurrent.futures.TimeoutError:
+        r = {"tier": "sonnet", "why": "router too slow, sending to agent", "error": "router timeout"}
+    ex.shutdown(wait=False, cancel_futures=True)
     outcome = decide(inst, r, posted)
     if outcome == "ignore":
         log_route(ctx, dict(r, tier="ignored"), time.time() - t0)
@@ -418,7 +447,7 @@ def main():
     log_route(ctx, r, time.time() - t0)
     ctx["tier"], ctx["why"] = r["tier"], r.get("why") or ""
     ctx["instant_reply"] = reply if posted else "(none posted)"
-    print(f"ctx-gate: instant in {t_inst:.1f}s posted={posted}; tier={r['tier']} via {r.get('router_model')} "
+    print(f"gate: instant in {t_inst:.1f}s posted={posted}; tier={r['tier']} via {r.get('router_model')} "
           f"total {time.time()-t0:.1f}s ({ctx['why']})", file=sys.stderr)
     if r["tier"] == "none":
         if posted:
@@ -429,6 +458,7 @@ def main():
 
     p["bot"] = ctx
     print(json.dumps(p))
+    _exit(0)
 
 
 if __name__ == "__main__":

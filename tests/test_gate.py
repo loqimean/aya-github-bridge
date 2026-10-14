@@ -31,6 +31,7 @@ def load_gate(config):
 
 
 gate = load_gate({"bot_login": "example-bot", "owner_login": "loqimean", "bot_name": "Hermes"})
+gate._exit = lambda code=0: sys.exit(code)   # production uses os._exit; tests need a catchable exit
 
 
 def comment_event(body, sender="loqimean", is_pr=False, assignees=()):
@@ -183,6 +184,22 @@ class GateFlowTests(Harness):
         self.assertEqual(out["bot"]["tier"], "sonnet")
         self.assertEqual(out["bot"]["instant_reply"], "(none posted)")
 
+    def test_slow_router_never_blows_hermes_timeout(self):
+        import time as _t
+        self.instant = {"reply": "Checking the diff now.", "followup": True}
+        gate.route = lambda ctx: (_t.sleep(3), {"tier": "none"})[1]
+        orig_remaining = gate.remaining
+        gate.remaining = lambda: 3.0
+        try:
+            started = _t.monotonic()
+            out = self.run_gate(comment_event("@example-bot ready to merge?", is_pr=True))
+            took = _t.monotonic() - started
+        finally:
+            gate.remaining = orig_remaining
+        self.assertLess(took, 2.5)                      # didn't wait for the slow router
+        self.assertEqual(out["bot"]["tier"], "sonnet")  # and still handed off to the agent
+        self.assertEqual(self.posts(), ["Checking the diff now."])
+
     def test_router_none_but_promise_forces_followup(self):
         self.instant = {"reply": "Looking at the diff now.", "followup": True}
         self.route = {"tier": "none", "why": "looks simple"}
@@ -221,6 +238,7 @@ class GateFlowTests(Harness):
 class ConfigTests(unittest.TestCase):
     def test_unconfigured_gate_drops_everything(self):
         bare = load_gate(None)
+        bare._exit = lambda code=0: sys.exit(code)
         out = io.StringIO()
         sys_stdin = sys.stdin
         sys.stdin = io.StringIO(json.dumps(comment_event("@example-bot hi")))
